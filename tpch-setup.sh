@@ -1,7 +1,7 @@
 #!/bin/bash
 
 function usage {
-	echo "Usage: tpch-setup.sh scale_factor [temp_directory]"
+	echo "Usage: tpch-setup.sh scale_factor [temp_directory] [exist_data_file_format]"
 	exit 1
 }
 
@@ -29,6 +29,7 @@ TABLES="part partsupp supplier customer orders lineitem nation region"
 # Get the parameters.
 SCALE=$1
 DIR=$2
+EXIST_DATA_FILE_FORMAT=$3
 BUCKETS=13
 if [ "X$DEBUG_SCRIPT" != "X" ]; then
 	set -x
@@ -45,55 +46,68 @@ if [ $SCALE -eq 1 ]; then
 	echo "Scale factor must be greater than 1"
 	exit 1
 fi
+if [ X"$EXIST_DATA_FILE_FORMAT" != "X" ]; then
+  if [ $EXIST_DATA_FILE_FORMAT = "orc" ]; then
+    echo "Orc file already exists, create hive table"
+    DATABASE=tpch_flat_orc_${SCALE}
+    runcommand "hive -i settings/load-flat.sql -f ddl-tpch/bin_flat/alltables_orc.sql -d DB=${DATABASE} -d LOCATION=${DIR}"
+    hive -i settings/load-flat.sql -f ddl-tpch/bin_flat/analyze.sql --database ${DATABASE};
+    echo "Data loaded into database ${DATABASE}."
+  else
+    echo "exist_data_file_format only supports setting to orc"
+    usage
+  fi
 
-# Do the actual data load.
-hdfs dfs -mkdir -p ${DIR}
-hdfs dfs -ls ${DIR}/${SCALE}/lineitem > /dev/null
-if [ $? -ne 0 ]; then
-	echo "Generating data at scale factor $SCALE."
-	(cd tpch-gen; hadoop jar target/*.jar -d ${DIR}/${SCALE}/ -s ${SCALE})
-fi
-hdfs dfs -ls ${DIR}/${SCALE}/lineitem > /dev/null
-if [ $? -ne 0 ]; then
-	echo "Data generation failed, exiting."
-	exit 1
-fi
-echo "TPC-H text data generation complete."
-
-# Create the text/flat tables as external tables. These will be later be converted to ORCFile.
-echo "Loading text data into external tables."
-runcommand "hive -i settings/load-flat.sql -f ddl-tpch/bin_flat/alltables.sql -d DB=tpch_text_${SCALE} -d LOCATION=${DIR}/${SCALE}"
-
-# Create the optimized tables.
-i=1
-total=8
-
-if test $SCALE -le 1000; then 
-	SCHEMA_TYPE=flat
 else
-	SCHEMA_TYPE=partitioned
-fi
+  # Do the actual data load.
+  hdfs dfs -mkdir -p ${DIR}
+  hdfs dfs -ls ${DIR}/${SCALE}/lineitem > /dev/null
+  if [ $? -ne 0 ]; then
+	  echo "Generating data at scale factor $SCALE."
+	  (cd tpch-gen; hadoop jar target/*.jar -d ${DIR}/${SCALE}/ -s ${SCALE})
+  fi
+  hdfs dfs -ls ${DIR}/${SCALE}/lineitem > /dev/null
+  if [ $? -ne 0 ]; then
+	  echo "Data generation failed, exiting."
+	  exit 1
+  fi
+  echo "TPC-H text data generation complete."
 
-DATABASE=tpch_${SCHEMA_TYPE}_orc_${SCALE}
-MAX_REDUCERS=2600 # ~7 years of data
-REDUCERS=$((test ${SCALE} -gt ${MAX_REDUCERS} && echo ${MAX_REDUCERS}) || echo ${SCALE})
+  # Create the text/flat tables as external tables. These will be later be converted to ORCFile.
+  echo "Loading text data into external tables."
+  runcommand "hive -i settings/load-flat.sql -f ddl-tpch/bin_flat/alltables.sql -d DB=tpch_text_${SCALE} -d LOCATION=${DIR}/${SCALE}"
 
-for t in ${TABLES}
-do
-	echo "Optimizing table $t ($i/$total)."
-	COMMAND="hive -i settings/load-${SCHEMA_TYPE}.sql -f ddl-tpch/bin_${SCHEMA_TYPE}/${t}.sql \
-	    -d DB=${DATABASE} \
-	    -d SOURCE=tpch_text_${SCALE} -d BUCKETS=${BUCKETS} \
+  # Create the optimized tables.
+  i=1
+  total=8
+
+  if test $SCALE -le 1000; then
+	  SCHEMA_TYPE=flat
+  else
+	  SCHEMA_TYPE=partitioned
+  fi
+
+  DATABASE=tpch_${SCHEMA_TYPE}_orc_${SCALE}
+  MAX_REDUCERS=2600 # ~7 years of data
+  REDUCERS=$((test ${SCALE} -gt ${MAX_REDUCERS} && echo ${MAX_REDUCERS}) || echo ${SCALE})
+
+  for t in ${TABLES}
+  do
+	  echo "Optimizing table $t ($i/$total)."
+	  COMMAND="hive -i settings/load-${SCHEMA_TYPE}.sql -f ddl-tpch/bin_${SCHEMA_TYPE}/${t}.sql \
+	      -d DB=${DATABASE} \
+	      -d SOURCE=tpch_text_${SCALE} -d BUCKETS=${BUCKETS} \
             -d SCALE=${SCALE} -d REDUCERS=${REDUCERS} \
-	    -d FILE=orc"
-	runcommand "$COMMAND"
-	if [ $? -ne 0 ]; then
-		echo "Command failed, try 'export DEBUG_SCRIPT=ON' and re-running"
-		exit 1
-	fi
-	i=`expr $i + 1`
-done
+	      -d FILE=orc"
+	  runcommand "$COMMAND"
+	  if [ $? -ne 0 ]; then
+		  echo "Command failed, try 'export DEBUG_SCRIPT=ON' and re-running"
+		  exit 1
+	  fi
+	  i=`expr $i + 1`
+  done
+  hive -i settings/load-${SCHEMA_TYPE}.sql -f ddl-tpch/bin_${SCHEMA_TYPE}/analyze.sql --database ${DATABASE};
 
-hive -i settings/load-${SCHEMA_TYPE}.sql -f ddl-tpch/bin_${SCHEMA_TYPE}/analyze.sql --database ${DATABASE}; 
+fi
 
 echo "Data loaded into database ${DATABASE}."
